@@ -8,6 +8,9 @@ const state = {
   metrics: null, returnStep: "project",
   promptMode: "initial_frame", promptFrameCount: null, promptOverrides: new Map(),
   chatThreads: [], chatThread: null, chatTarget: null,
+  agentSessions: [], agentSession: null, retrievalStatus: null, crewStatus: null, crewPreflight: null, showMasterAgent: false,
+  archivedAgentSessions: [], showArchivedAgentSessions: false, expandedAgentMessages: new Set(),
+  agentThinking: false,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -21,6 +24,29 @@ const formatPromptPreview = (value = "") => String(value)
   .trim();
 const statusLabels = { DRAFT_SCRIPT: "项目草稿", SCRIPT_REVIEW: "剧本待确认", SCRIPT_APPROVED: "剧本已确认", ASSET_REVIEW: "资产整理中", SHOT_LIST_REVIEW: "分镜设计中", PROMPT_REVIEW: "提示词制作中", COMPLETED: "制作完成" };
 const assetTypeLabels = { character: "人物", location: "场景", prop: "道具" };
+const agentStageLabels = {
+  project_script: "创建项目与剧本",
+  assets: "提取资产与提示词",
+  shots: "拆分分镜",
+  prompts: "生成镜头提示词",
+  images: "图片批次建议",
+};
+const agentTaskStatusLabels = {
+  pending: "未开始",
+  awaiting_approval: "等待确认",
+  running: "执行中",
+  completed: "已完成",
+  failed: "执行失败",
+  cancelled: "已取消",
+};
+const agentSessionStatusLabels = {
+  clarifying: "澄清需求中",
+  plan_ready: "可生成计划",
+  awaiting_approval: "等待确认",
+  awaiting_stage_approval: "等待阶段确认",
+  completed: "已完成",
+  cancelled: "已取消",
+};
 const automaticFrameCount = duration => duration <= 3 ? 4 : duration <= 6 ? 6 : 9;
 
 async function request(path, options = {}) {
@@ -116,6 +142,11 @@ function renderWorkflow() {
 
 function render() {
   renderSidebar(); renderHeader(); renderWorkflow();
+  if (!state.project || state.showMasterAgent) {
+    renderMasterAgent();
+    $("#chat-launcher").hidden = true;
+    return;
+  }
   const views = { project: renderProject, script: renderScript, assets: renderAssets, shots: renderShots, prompts: renderPrompts, metrics: renderMetrics };
   views[state.step]();
   const chatAvailable = state.project && ["script", "assets", "shots", "prompts"].includes(state.step);
@@ -171,11 +202,205 @@ function renderProject() {
   }
   const p = state.project;
   $("#content").innerHTML = `
-    <div class="section-head"><div><span class="eyebrow">PRODUCTION OVERVIEW</span><h2>项目设定</h2><p>这是后续剧本、分镜和提示词共用的创作基准。</p></div><div class="actions"><button class="button" data-action="edit-project">编辑项目设定</button><button class="button primary" data-step-next="script">进入剧本创作 →</button></div></div>
+    <div class="section-head"><div><span class="eyebrow">PRODUCTION OVERVIEW</span><h2>项目设定</h2><p>这是后续剧本、分镜和提示词共用的创作基准。</p></div><div class="actions"><button class="button" data-action="open-master-agent">总控智能体</button><button class="button" data-action="edit-project">编辑项目设定</button><button class="button primary" data-step-next="script">进入剧本创作 →</button></div></div>
     <div class="overview-grid">
       <article class="panel project-card"><span class="tag">${esc(statusLabels[p.status] || p.status)}</span><h3>${esc(p.name)}</h3><p>${esc(p.description || "尚未填写故事简介。你仍然可以在剧本阶段直接开始创作。")}</p></article>
       <aside class="panel details-card"><span class="eyebrow">CREATIVE PROFILE</span><div class="details-list"><div class="detail-row"><span>世界与地域设定</span><strong>${esc(p.world_setting || "尚未设定")}</strong></div><div class="detail-row"><span>视觉风格</span><strong>${esc(p.visual_style)}</strong></div><div class="detail-row"><span>输出画幅</span><strong>${esc(p.aspect_ratio)}</strong></div><div class="detail-row"><span>创作语言</span><strong>${esc(p.language)}</strong></div><div class="detail-row"><span>当前阶段</span><strong>${esc(statusLabels[p.status] || p.status)}</strong></div></div></aside>
     </div>`;
+}
+
+function getLatestAssistantMessage(messages = []) {
+    return [...messages].reverse().find(message => message.role === "assistant");
+  }
+
+function shouldCollapseAgentMessage(message) {
+  return message.role === "user" && (message.content.length > 600 || message.content.split(/\r?\n/).length > 8);
+}
+
+function agentMessagePreview(content) {
+  const lines = content.split(/\r?\n/);
+  const previewLines = lines.slice(0, 4).join("\n");
+  return previewLines.length > 300 ? `${previewLines.slice(0, 300)}…` : previewLines;
+}
+
+function renderAgentMessage(message) {
+  const collapsible = shouldCollapseAgentMessage(message);
+  const expanded = state.expandedAgentMessages.has(message.id);
+  const content = collapsible && !expanded ? agentMessagePreview(message.content) : message.content;
+  return `<div class="master-message ${message.role} ${collapsible && !expanded ? "collapsed" : ""}">
+    <small>${message.role === "user" ? "你" : "智能体"}</small>
+    <div class="master-message-content">${esc(content)}</div>
+    ${collapsible ? `<button class="message-toggle" type="button" data-toggle-agent-message="${message.id}">${expanded ? "收起" : "展开全文"}</button>` : ""}
+  </div>`;
+}
+
+function renderAgentReplyOptions(message) {
+  const options = message?.metadata_json?.reply_options || [];
+  if (!options.length) return "";
+  return `<div class="agent-reply-options" aria-label="建议回复">${options.map((option, index) => `
+    <button class="agent-option-button" type="button" data-agent-option="${index}">
+      <strong>${esc(option.label)}</strong>
+      ${option.description ? `<span>${esc(option.description)}</span>` : ""}
+      ${option.fact_chips?.length ? `<div class="agent-option-facts">${option.fact_chips.map(chip => `<em>${esc(chip.label)}：${esc(chip.value)}</em>`).join("")}</div>` : ""}
+    </button>`).join("")}</div>`;
+}
+
+async function sendAgentMessage(content, facts = {}) {
+    if (!content || !state.agentSession) return;
+    state.agentThinking = true;
+    renderMasterAgent();
+    try {
+      state.agentSession = await request(`/agent/sessions/${state.agentSession.id}/messages`, {
+        method: "POST", body: JSON.stringify({ content, facts }),
+      });
+      await refreshAgentSessionLists();
+    } finally {
+      state.agentThinking = false;
+      renderMasterAgent();
+    }
+  }
+
+async function handleAgentOption(button) {
+    const latest = getLatestAssistantMessage(state.agentSession?.messages || []);
+    const option = latest?.metadata_json?.reply_options?.[Number(button.dataset.agentOption)];
+    if (!option) return;
+    if (option.action === "generate_plan") {
+      await generateAgentPlan();
+      return;
+    }
+    if (option.action === "approve_plan") {
+      await approveAgentPlan(option.plan_id);
+      return;
+    }
+    if (option.action === "approve_stage") {
+      await approveAgentStage(option.plan_id, option.stage);
+      return;
+    }
+    if (option.action === "research_web") {
+      await researchAgentSession(option.query || option.content || option.label);
+      return;
+    }
+    if (option.action === "defer_plan") {
+      toast("计划已保留，可稍后从这个对话继续执行");
+      return;
+    }
+    if (option.custom) {
+      const input = $("#master-agent-input");
+      if (input) {
+        input.placeholder = option.placeholder || "输入你的其它想法……";
+        input.focus();
+      }
+      return;
+    }
+    await sendAgentMessage(option.content || option.label, option.facts || {});
+  }
+
+function renderAgentSessionHistory() {
+  const sessions = state.showArchivedAgentSessions ? state.archivedAgentSessions : state.agentSessions;
+  return `<section class="panel agent-context-card agent-session-history">
+    <div class="agent-history-head"><div><span class="eyebrow">CONVERSATIONS</span><h3>${state.showArchivedAgentSessions ? "已归档对话" : "对话历史"}</h3></div><button class="button" data-action="toggle-agent-archive-view">${state.showArchivedAgentSessions ? "查看当前" : "查看归档"}</button></div>
+    ${sessions.length ? `<div class="agent-session-list">${sessions.map(item => `
+      <article class="agent-session-item ${state.agentSession?.id === item.id ? "active" : ""}">
+        <button type="button" data-agent-session-id="${item.id}">
+          <strong>${esc(item.title)}</strong>
+          <small>${esc(agentSessionStatusLabels[item.status] || item.status)} · ${item.messages?.length || 0} 条 · ${new Date(item.updated_at).toLocaleString("zh-CN", {month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"})}</small>
+        </button>
+        <div class="agent-session-actions">
+          ${state.showArchivedAgentSessions ? `<button class="button" data-agent-unarchive-session="${item.id}">恢复</button>` : `<button class="button" data-agent-archive-session="${item.id}">归档</button>`}
+          <button class="button danger" data-agent-delete-session="${item.id}">删除</button>
+        </div>
+      </article>`).join("")}</div>` : `<p>${state.showArchivedAgentSessions ? "暂无归档对话。" : "暂无历史对话。"}</p>`}
+  </section>`;
+}
+
+function renderMasterAgent() {
+  const session = state.agentSession;
+  const status = state.retrievalStatus;
+  const crew = state.crewStatus;
+  const retrievalRows = status ? [
+    ["Embedding", status.enabled ? "enabled" : "disabled"],
+    ["Vector DB", status.qdrant_local ? "Qdrant Local" : "unavailable"],
+    ["Model", status.model || "-"],
+    ["Device", status.device || "-"],
+    ["Index", status.index_status || "-"],
+    ["Jobs", `${status.pending_jobs || 0} pending / ${status.failed_jobs || 0} failed`],
+    ["DeepSeek Thinking", status.deepseek_thinking_enabled ? `enabled · ${status.deepseek_reasoning_effort || "high"}` : "disabled"],
+    ["Web Search", status.web_search_configured ? "configured" : "unavailable"],
+  ] : [];
+  const crewRows = crew ? [
+    ["Framework", crew.framework],
+    ["Installed", crew.installed ? "yes" : "no"],
+    ["Runtime", crew.active ? "CrewAI active" : `fallback: ${crew.fallback || "orchestrator"}`],
+    ["Roles", `${crew.roles?.length || 0}`],
+    ["Tasks", `${crew.tasks?.length || 0}`],
+  ] : [];
+  const plan = session?.plans?.at(-1);
+  const activeTask = plan?.tasks?.find(task => ["failed", "running", "awaiting_approval"].includes(task.status));
+  const showCheckpoint = activeTask && ["failed", "running", "cancelled"].includes(activeTask.status);
+  const memories = session?.memories || [];
+  const missing = session?.messages?.at(-1)?.metadata_json?.missing_information || [];
+  const messages = session?.messages || [];
+  const latestAssistant = getLatestAssistantMessage(messages);
+  const thinkingHtml = state.agentThinking ? `<div class="master-message assistant agent-thinking"><small>智能体</small><i></i><i></i><i></i><b>正在思考下一步……</b></div>` : "";
+  $("#content").innerHTML = `
+    <div class="agent-home">
+      <div class="section-head"><div><span class="eyebrow">MASTER PRODUCTION AGENT</span><h2>从一句话开始完成整部影片的前期工作</h2><p>先澄清创作设定、生成计划，再由你逐阶段确认执行。</p></div><div class="actions">${state.project ? `<button class="button" data-action="close-master-agent">返回项目</button>` : ""}<button class="button" data-action="new-agent-session">新会话</button></div></div>
+      <div class="agent-home-grid">
+        <section class="panel master-agent-panel">
+          <header><div><span class="eyebrow">${session ? esc(agentSessionStatusLabels[session.status] || session.status) : "READY"}</span><h3>${esc(session?.title || "总控智能体")}</h3></div><span class="rag-badge ${status?.available ? "ready" : "fallback"}">${status?.available ? "BGE-M3 · QDRANT" : "关键词检索模式"}</span></header>
+          <div class="master-agent-messages">${messages.length ? messages.map(renderAgentMessage).join("") : `<div class="agent-welcome"><strong>描述你的故事，或粘贴完整剧本</strong><p>我会识别视觉风格、时间地点和画幅；不确定的信息会先询问，不会直接创建项目。首帧/故事板会在后续按每个镜头复杂度自动判断。</p></div>`}</div>
+          ${session ? `<form id="master-agent-form" class="master-agent-form">${state.agentThinking ? "" : renderAgentReplyOptions(latestAssistant)}<textarea id="master-agent-input" required rows="4" placeholder="继续描述故事、回答设定问题，或粘贴剧本；项目标题、风格、地点和画幅都可以直接用对话确认……"></textarea><div class="master-agent-compose"><label class="button">上传 .txt / .md<input id="master-agent-file" type="file" accept=".txt,.md,text/plain,text/markdown" hidden></label><button class="button primary" type="submit">发送</button></div></form>` : `<div class="agent-start"><button class="button primary" data-action="new-agent-session">开始与智能体对话</button></div>`}
+        </section>
+        <aside class="agent-context-column">
+          ${renderAgentSessionHistory()}
+          <section class="panel agent-context-card"><span class="eyebrow">CREATIVE MEMORY</span><h3>已确认创作信息</h3>${memories.length ? memories.map(item => `<div class="memory-row"><span>${esc(item.key)}</span><strong>${esc(item.value)}</strong></div>`).join("") : `<p>对话后会在这里形成可追溯的项目记忆。</p>`}${missing.length ? `<div class="missing-box"><strong>仍需确认</strong><p>${missing.map(esc).join("、")}</p></div>` : ""}</section>
+          <section class="panel agent-context-card"><span class="eyebrow">WORKFLOW PLAN</span><h3>制作计划</h3>${plan ? `<div class="agent-stage-list">${plan.tasks.map(task => `<div class="agent-stage ${task.status}"><span>${String(task.sequence).padStart(2,"0")}</span><div><strong>${esc(agentStageLabels[task.stage] || task.stage)}</strong><small>${esc(agentTaskStatusLabels[task.status] || task.status)}</small></div></div>`).join("")}</div>${!session.project_id ? `<p>计划已生成，请在对话中选择是否立即执行。</p>` : activeTask ? `<button class="button primary full" data-agent-stage="${activeTask.stage}" data-agent-plan="${plan.id}" ${activeTask.status === "running" ? "disabled" : ""}>${activeTask.status === "failed" ? "重试" : "确认执行"} · ${esc(agentStageLabels[activeTask.stage] || activeTask.stage)}</button>` : ""}` : session && session.status === "plan_ready" ? `<p>可以在对话中选择“生成完整制作计划”。</p>` : `<p>关键信息齐全后才会生成计划。</p>`}</section>
+        </aside>
+      </div>
+    </div>`;
+  const messageContainer = $(".master-agent-messages");
+  if (messageContainer) {
+    if (state.agentThinking) {
+      messageContainer.insertAdjacentHTML("beforeend", thinkingHtml);
+    }
+    messageContainer.scrollTop = messageContainer.scrollHeight;
+  }
+  if (state.agentThinking) {
+    const input = $("#master-agent-input");
+    if (input) input.disabled = true;
+    $("#master-agent-form button[type='submit']")?.setAttribute("disabled", "disabled");
+  }
+  const agentContextColumn = $(".agent-context-column");
+  if (agentContextColumn && status) {
+    agentContextColumn.insertAdjacentHTML("beforeend", `
+      <section class="panel agent-context-card"><span class="eyebrow">LOCAL RAG</span><h3>Retrieval Status</h3>
+        ${retrievalRows.map(([key, value]) => `<div class="memory-row"><span>${esc(key)}</span><strong>${esc(value)}</strong></div>`).join("")}
+        ${!status.available ? `<div class="missing-box"><strong>Fallback active</strong><p>Embedding is unavailable, so the agent will use keyword retrieval.</p></div>` : ""}
+      </section>`);
+  }
+  if (agentContextColumn && crew) {
+    const preflight = state.crewPreflight;
+    agentContextColumn.insertAdjacentHTML("beforeend", `
+      <section class="panel agent-context-card"><span class="eyebrow">AGENT RUNTIME</span><h3>CrewAI Status</h3>
+        ${crewRows.map(([key, value]) => `<div class="memory-row"><span>${esc(key)}</span><strong>${esc(value)}</strong></div>`).join("")}
+        ${preflight ? `<div class="missing-box"><strong>${preflight.can_exercise_workflow ? "Ready to verify" : "Needs attention"}</strong><p>${esc(preflight.message)}</p></div>` : ""}
+        <button class="button full" data-action="crew-preflight">运行预检</button>
+      </section>`);
+  }
+  if (agentContextColumn && showCheckpoint) {
+    const checkpoint = activeTask.result_data?.checkpoint || {};
+    const recovery = activeTask.result_data?.recovery || {};
+    const resumeDisabled = activeTask.status === "completed" || activeTask.status === "cancelled" || recovery.retryable === false;
+    const cancelDisabled = activeTask.status === "completed" || activeTask.status === "cancelled";
+    agentContextColumn.insertAdjacentHTML("beforeend", `
+      <section class="panel agent-context-card"><span class="eyebrow">CHECKPOINT</span><h3>Resume State</h3>
+        <div class="memory-row"><span>Agent</span><strong>${esc(checkpoint.agent_key || "-")}</strong></div>
+        <div class="memory-row"><span>Status</span><strong>${esc(checkpoint.status || activeTask.status)}</strong></div>
+        <div class="memory-row"><span>Last safe step</span><strong>${esc(checkpoint.last_safe_step || "not_started")}</strong></div>
+        ${recovery.error_type ? `<div class="missing-box"><strong>${esc(recovery.error_type)}</strong><p>${esc(activeTask.error_message || "Workflow task interrupted.")}</p></div>` : ""}
+        <div class="actions"><button class="button" data-agent-resume-task="${activeTask.id}" ${resumeDisabled ? "disabled" : ""}>继续执行</button><button class="button danger" data-agent-cancel-task="${activeTask.id}" ${cancelDisabled ? "disabled" : ""}>取消任务</button></div>
+      </section>`);
+  }
 }
 
 function renderScript() {
@@ -222,15 +447,149 @@ function renderPrompts() {
     <div class="section-head"><div><span class="eyebrow">PROMPT LAB</span><h2>镜头提示词</h2><p>首帧模式用于视频起始画面；故事板模式在一张图中展示镜头从开始到结束的连续帧。</p></div><div class="actions"><button class="button" data-step-next="shots">← 返回分镜</button>${shots.length ? `<button class="button primary" data-action="generate-all-prompts">一键生成全部提示词</button>` : ""}</div></div>
     ${shots.length ? `<section class="panel prompt-mode-panel"><div><span class="eyebrow">PAGE DEFAULT</span><strong>页面默认生成模式</strong></div><div class="mode-tabs"><button class="mode-tab ${state.promptMode === "initial_frame" ? "active" : ""}" data-prompt-default-mode="initial_frame">视频首帧</button><button class="mode-tab ${state.promptMode === "storyboard" ? "active" : ""}" data-prompt-default-mode="storyboard">连续帧故事板</button></div><label class="prompt-frame-select">故事板帧数<select data-prompt-default-frames ${state.promptMode === "storyboard" ? "" : "disabled"}><option value="auto" ${state.promptFrameCount === null ? "selected" : ""}>自动 · 按镜头时长</option><option value="4" ${state.promptFrameCount === 4 ? "selected" : ""}>4 帧 · 2×2</option><option value="6" ${state.promptFrameCount === 6 ? "selected" : ""}>6 帧 · 2×3</option><option value="9" ${state.promptFrameCount === 9 ? "selected" : ""}>9 帧 · 3×3</option></select></label></section>` : ""}
     ${!shots.length ? `<div class="empty-state"><div><div class="empty-state-icon">03</div><h2>还没有可用镜头</h2><p>先完成分镜拆分，再为每个镜头生成提示词。</p><button class="button primary" data-step-next="shots">前往分镜设计</button></div></div>` : `<div class="prompt-list">${shots.map((shot, index) => { const versions = state.prompts.get(shot.id) || []; const prompt = versions[0]; return `
-      ${(() => { const metadata = prompt?.prompt_metadata || {}; const promptMode = metadata.mode || "initial_frame"; const frames = metadata.frames || []; const override = state.promptOverrides.get(shot.id) || { mode: "default", frame_count: "inherit" }; const effectiveMode = override.mode === "default" ? state.promptMode : override.mode; const frameControlEnabled = effectiveMode === "storyboard"; const effectiveFrameCount = override.frame_count === "inherit" ? state.promptFrameCount : override.frame_count; const autoFrames = automaticFrameCount(Number(shot.duration_seconds || 4)); return `<article class="panel prompt-card"><div class="prompt-shot"><span class="shot-id">${esc(shot.scene.heading)} · SHOT ${String(shot.sequence).padStart(2,"0")} · ${Number(shot.duration_seconds || 4).toFixed(1)}s</span><h3>${esc(shot.subject)}</h3><p>${esc(shot.action)}</p><div class="shot-prompt-options"><label>本镜头模式<select data-shot-prompt-mode="${shot.id}"><option value="default" ${override.mode === "default" ? "selected" : ""}>跟随页面</option><option value="initial_frame" ${override.mode === "initial_frame" ? "selected" : ""}>视频首帧</option><option value="storyboard" ${override.mode === "storyboard" ? "selected" : ""}>连续帧故事板</option></select></label><label>帧数<select data-shot-frame-count="${shot.id}" ${frameControlEnabled ? "" : "disabled"}><option value="inherit" ${override.frame_count === "inherit" ? "selected" : ""}>跟随页面</option><option value="auto" ${override.frame_count === null ? "selected" : ""}>自动 ${autoFrames}</option><option value="4" ${override.frame_count === 4 ? "selected" : ""}>4</option><option value="6" ${override.frame_count === 6 ? "selected" : ""}>6</option><option value="9" ${override.frame_count === 9 ? "selected" : ""}>9</option></select></label></div></div><div class="prompt-body">${prompt ? `<label>${promptMode === "storyboard" ? `STORYBOARD · ${metadata.frame_count || frames.length} FRAMES · ${esc(metadata.layout || "")} · ${metadata.frame_count_source === "duration_auto" ? "AUTO" : "MANUAL"}` : "INITIAL FRAME"} · V${prompt.version}</label><div class="prompt-text">${esc(prompt.positive_prompt)}</div>${frames.length ? `<details class="storyboard-frames"><summary>查看 ${frames.length} 个连续帧</summary>${frames.map(frame => `<div class="storyboard-frame"><div><strong>FRAME ${frame.index} · ${esc(frame.phase)}</strong><p>${esc(frame.description)}</p></div><button class="button" data-copy-frame="${shot.id}" data-frame-index="${frame.index}">复制此帧</button></div>`).join("")}</details>` : ""}${prompt.negative_prompt ? `<label>NEGATIVE PROMPT</label><div class="prompt-text negative">${esc(prompt.negative_prompt)}</div>` : ""}` : `<div class="prompt-empty">这个镜头尚未生成提示词。</div>`}</div><div class="prompt-card-actions">${prompt ? `<button class="button copy-button" data-copy-prompt="${shot.id}">${promptMode === "storyboard" ? "复制整版" : "复制首帧"}</button>` : ""}<button class="button ${prompt ? "" : "primary"}" data-generate-prompt="${shot.id}">${prompt ? "重新生成" : "生成提示词"}</button></div></article>`; })()}`; }).join("")}</div>`}`;
+      ${(() => { const metadata = prompt?.prompt_metadata || {}; const promptMode = metadata.mode || "initial_frame"; const frames = metadata.frames || []; const directorOverhead = metadata.director_overhead; const override = state.promptOverrides.get(shot.id) || { mode: "default", frame_count: "inherit" }; const effectiveMode = override.mode === "default" ? state.promptMode : override.mode; const frameControlEnabled = effectiveMode === "storyboard"; const effectiveFrameCount = override.frame_count === "inherit" ? state.promptFrameCount : override.frame_count; const autoFrames = automaticFrameCount(Number(shot.duration_seconds || 4)); return `<article class="panel prompt-card"><div class="prompt-shot"><span class="shot-id">${esc(shot.scene.heading)} · SHOT ${String(shot.sequence).padStart(2,"0")} · ${Number(shot.duration_seconds || 4).toFixed(1)}s</span><h3>${esc(shot.subject)}</h3><p>${esc(shot.action)}</p><div class="shot-prompt-options"><label>本镜头模式<select data-shot-prompt-mode="${shot.id}"><option value="default" ${override.mode === "default" ? "selected" : ""}>跟随页面</option><option value="initial_frame" ${override.mode === "initial_frame" ? "selected" : ""}>视频首帧</option><option value="storyboard" ${override.mode === "storyboard" ? "selected" : ""}>连续帧故事板</option></select></label><label>帧数<select data-shot-frame-count="${shot.id}" ${frameControlEnabled ? "" : "disabled"}><option value="inherit" ${override.frame_count === "inherit" ? "selected" : ""}>跟随页面</option><option value="auto" ${override.frame_count === null ? "selected" : ""}>自动 ${autoFrames}</option><option value="4" ${override.frame_count === 4 ? "selected" : ""}>4</option><option value="6" ${override.frame_count === 6 ? "selected" : ""}>6</option><option value="9" ${override.frame_count === 9 ? "selected" : ""}>9</option></select></label></div></div><div class="prompt-body">${prompt ? `<label>${promptMode === "storyboard" ? `STORYBOARD · ${metadata.frame_count || frames.length} FRAMES · ${esc(metadata.layout || "")} · ${metadata.frame_count_source === "duration_auto" ? "AUTO" : "MANUAL"}` : "INITIAL FRAME"} · V${prompt.version}</label><div class="prompt-text">${esc(prompt.positive_prompt)}</div>${frames.length ? `<details class="storyboard-frames"><summary>查看 ${frames.length} 个连续帧</summary>${frames.map(frame => `<div class="storyboard-frame"><div><strong>FRAME ${frame.index} · ${esc(frame.phase)}</strong><p>${esc(frame.description)}</p></div><button class="button" data-copy-frame="${shot.id}" data-frame-index="${frame.index}">复制此帧</button></div>`).join("")}</details>` : ""}${directorOverhead ? `<details class="storyboard-frames"><summary>导演俯视参考图提示词</summary><div class="storyboard-frame"><div><strong>DIRECTOR OVERHEAD · ${esc(directorOverhead.purpose || "blocking")}</strong><p>${esc(directorOverhead.positive_prompt || "")}</p></div><button class="button" data-copy-director-overhead="${shot.id}">复制俯视图</button></div>${directorOverhead.negative_prompt ? `<div class="storyboard-frame"><div><strong>NEGATIVE</strong><p>${esc(directorOverhead.negative_prompt)}</p></div></div>` : ""}</details>` : ""}${prompt.negative_prompt ? `<label>NEGATIVE PROMPT</label><div class="prompt-text negative">${esc(prompt.negative_prompt)}</div>` : ""}` : `<div class="prompt-empty">这个镜头尚未生成提示词。</div>`}</div><div class="prompt-card-actions">${prompt ? `<button class="button copy-button" data-copy-prompt="${shot.id}">${promptMode === "storyboard" ? "复制整版" : "复制首帧"}</button>${directorOverhead ? `<button class="button" data-copy-director-overhead="${shot.id}">复制俯视图</button>` : ""}` : ""}<button class="button ${prompt ? "" : "primary"}" data-generate-prompt="${shot.id}">${prompt ? "重新生成" : "生成提示词"}</button></div></article>`; })()}`; }).join("")}</div>`}`;
   window.currentPromptShots = shots;
 }
 
 async function loadProjects(selectId = null) {
-  state.projects = await request("/projects");
+  [state.projects, state.agentSessions, state.archivedAgentSessions, state.retrievalStatus, state.crewStatus] = await Promise.all([
+    request("/projects"), request("/agent/sessions"), request("/agent/sessions?archived=true"), request("/agent/retrieval/status"), request("/agent/crew/status"),
+  ]);
+  state.agentSession = state.agentSessions[0] || null;
   if (selectId) await selectProject(selectId);
   else if (state.projects.length) await selectProject(state.projects[0].id);
   else render();
+}
+
+async function refreshAgentSessionLists() {
+  [state.agentSessions, state.archivedAgentSessions] = await Promise.all([
+    request("/agent/sessions"),
+    request("/agent/sessions?archived=true"),
+  ]);
+}
+
+async function createAgentSession() {
+  const session = await request("/agent/sessions", {
+    method: "POST", body: JSON.stringify({ title: "新的影片计划" }),
+  });
+  await refreshAgentSessionLists();
+  state.agentSession = session; state.showMasterAgent = true; state.showArchivedAgentSessions = false; render();
+}
+
+async function selectAgentSession(sessionId) {
+  state.agentSession = await request(`/agent/sessions/${sessionId}`);
+  state.showMasterAgent = true;
+  render();
+}
+
+async function refreshAgentSession() {
+  if (!state.agentSession) return;
+  state.agentSession = await request(`/agent/sessions/${state.agentSession.id}`);
+  await refreshAgentSessionLists();
+}
+
+async function archiveAgentSession(sessionId) {
+  await request(`/agent/sessions/${sessionId}/archive`, { method: "POST" });
+  await refreshAgentSessionLists();
+  if (state.agentSession?.id === sessionId) state.agentSession = state.agentSessions[0] || null;
+  state.showArchivedAgentSessions = false;
+  render();
+  toast("对话已归档");
+}
+
+async function unarchiveAgentSession(sessionId) {
+  const session = await request(`/agent/sessions/${sessionId}/unarchive`, { method: "POST" });
+  await refreshAgentSessionLists();
+  state.agentSession = session;
+  state.showArchivedAgentSessions = false;
+  state.showMasterAgent = true;
+  render();
+  toast("对话已恢复");
+}
+
+async function deleteAgentSession(sessionId) {
+  if (!window.confirm("确定永久删除这个 Agent 对话吗？该操作不会删除已创建的项目。")) return;
+  await request(`/agent/sessions/${sessionId}`, { method: "DELETE" });
+  state.expandedAgentMessages.clear();
+  await refreshAgentSessionLists();
+  if (state.agentSession?.id === sessionId) state.agentSession = state.agentSessions[0] || null;
+  if (state.showArchivedAgentSessions && !state.archivedAgentSessions.length) state.showArchivedAgentSessions = false;
+  render();
+  toast("对话已删除");
+}
+
+async function generateAgentPlan() {
+  const plan = await request(`/agent/sessions/${state.agentSession.id}/plan`, { method: "POST", body: "{}" });
+  await refreshAgentSession(); renderMasterAgent(); toast(`计划 V${plan.version} 已生成`);
+}
+
+async function runCrewPreflight() {
+  state.crewPreflight = await request("/agent/crew/preflight", { method: "POST" });
+  renderMasterAgent();
+  toast(state.crewPreflight.can_exercise_workflow ? "CrewAI preflight ready" : "CrewAI preflight needs attention");
+}
+
+async function researchAgentSession(query) {
+  if (!state.agentSession || !query) return;
+  loading(true, "正在联网搜索", "正在检索公开资料并整理为对话摘要");
+  try {
+    state.agentSession = await request(`/agent/sessions/${state.agentSession.id}/research`, {
+      method: "POST", body: JSON.stringify({ query }),
+    });
+    await refreshAgentSessionLists();
+    renderMasterAgent();
+    toast("联网搜索完成");
+  } finally {
+    loading(false);
+  }
+}
+
+async function approveAgentPlan(planId) {
+  loading(true, "正在创建项目与剧本", "完成后将建立本地语义索引");
+  await request("/agent/crew/tools/create_project/execute", {
+    method: "POST", body: JSON.stringify({ plan_id: planId }),
+  });
+  await refreshAgentSession();
+  state.projects = await request("/projects");
+  state.project = state.projects.find(item => item.id === state.agentSession.project_id) || null;
+  if (state.project) await selectProject(state.project.id);
+  state.showMasterAgent = true; loading(false); render(); toast("项目与剧本已创建");
+}
+
+async function approveAgentStage(planId, stage) {
+  const stageTool = {
+    assets: "extract_assets",
+    shots: "generate_storyboard",
+    prompts: "generate_shot_prompts",
+  }[stage];
+  loading(true, `正在执行 ${stage}`, "该阶段可能调用外部模型，请稍候");
+  if (stageTool) {
+    await request(`/agent/crew/tools/${stageTool}/execute`, {
+      method: "POST", body: JSON.stringify({ plan_id: planId }),
+    });
+  } else {
+    await request(`/agent/plans/${planId}/stages/${stage}/approve`, { method: "POST" });
+  }
+  await refreshAgentSession();
+  if (state.agentSession.project_id) await selectProject(state.agentSession.project_id);
+  state.showMasterAgent = true; loading(false); render(); toast(`${stage} 阶段已完成`);
+}
+
+async function resumeAgentTask(taskId) {
+  await request(`/agent/tasks/${taskId}/resume`, { method: "POST" });
+  await refreshAgentSession();
+  state.showMasterAgent = true;
+  render();
+  toast("任务已恢复到等待确认状态");
+}
+
+async function cancelAgentTask(taskId) {
+  if (!window.confirm("确定取消这个工作流任务吗？")) return;
+  await request(`/agent/tasks/${taskId}/cancel`, { method: "POST" });
+  await refreshAgentSession();
+  state.showMasterAgent = true;
+  render();
+  toast("任务已取消");
 }
 
 async function selectProject(id) {
@@ -532,6 +891,9 @@ document.addEventListener("click", event => {
 }, true);
 
 document.addEventListener("click", async event => {
+  const agentOptionButton = event.target.closest("[data-agent-option]");
+  const approveMasterPlan = event.target.closest("[data-agent-approve-plan]");
+  const approveMasterStage = event.target.closest("[data-agent-stage]");
   const chatTargetButton = event.target.closest("[data-chat-target]");
   const projectButton = event.target.closest("[data-project-id]");
   const stepButton = event.target.closest("[data-step], [data-step-next]");
@@ -551,11 +913,30 @@ document.addEventListener("click", async event => {
   const generatePromptButton = event.target.closest("[data-generate-prompt]");
   const copyPromptButton = event.target.closest("[data-copy-prompt]");
   const copyFrameButton = event.target.closest("[data-copy-frame]");
+  const copyDirectorOverheadButton = event.target.closest("[data-copy-director-overhead]");
   const deleteShotButton = event.target.closest("[data-delete-shot]");
   const shotCard = chatTargetButton ? null : event.target.closest("[data-shot-id]");
   const agentRun = event.target.closest("[data-agent-run]");
+  const agentSessionButton = event.target.closest("[data-agent-session-id]");
+  const archiveAgentButton = event.target.closest("[data-agent-archive-session]");
+  const unarchiveAgentButton = event.target.closest("[data-agent-unarchive-session]");
+  const deleteAgentButton = event.target.closest("[data-agent-delete-session]");
+  const toggleAgentMessageButton = event.target.closest("[data-toggle-agent-message]");
   try {
-    if (agentRun) await openAgentRunDetail(agentRun.dataset.agentRun);
+    if (agentOptionButton) await handleAgentOption(agentOptionButton);
+    else if (agentSessionButton) await selectAgentSession(agentSessionButton.dataset.agentSessionId);
+    else if (archiveAgentButton) await archiveAgentSession(archiveAgentButton.dataset.agentArchiveSession);
+    else if (unarchiveAgentButton) await unarchiveAgentSession(unarchiveAgentButton.dataset.agentUnarchiveSession);
+    else if (deleteAgentButton) await deleteAgentSession(deleteAgentButton.dataset.agentDeleteSession);
+    else if (toggleAgentMessageButton) {
+      const id = toggleAgentMessageButton.dataset.toggleAgentMessage;
+      if (state.expandedAgentMessages.has(id)) state.expandedAgentMessages.delete(id);
+      else state.expandedAgentMessages.add(id);
+      renderMasterAgent();
+    }
+    else if (approveMasterPlan) await approveAgentPlan(approveMasterPlan.dataset.agentApprovePlan);
+    else if (approveMasterStage) await approveAgentStage(approveMasterStage.dataset.agentPlan, approveMasterStage.dataset.agentStage);
+    else if (agentRun) await openAgentRunDetail(agentRun.dataset.agentRun);
     else if (projectButton) { await selectProject(projectButton.dataset.projectId); setStep("project"); }
     else if (stepButton && !stepButton.disabled) setStep(stepButton.dataset.step || stepButton.dataset.stepNext);
     else if (modeButton) { state.scriptMode = modeButton.dataset.scriptMode; renderScript(); }
@@ -593,6 +974,15 @@ document.addEventListener("click", async event => {
     else if (deleteShotButton) await deleteShot(deleteShotButton.dataset.deleteShot);
     else if (shotCard) openShotDialog(state.scenes.flatMap(s => s.shots).find(s => s.id === shotCard.dataset.shotId));
     else if (event.target.closest("#new-project-button") || actionButton?.dataset.action === "new-project") openProjectDialog();
+    else if (actionButton?.dataset.action === "new-agent-session") await createAgentSession();
+    else if (actionButton?.dataset.action === "open-master-agent") { state.showMasterAgent = true; render(); }
+    else if (actionButton?.dataset.action === "close-master-agent") { state.showMasterAgent = false; render(); }
+    else if (actionButton?.dataset.action === "generate-agent-plan") await generateAgentPlan();
+    else if (actionButton?.dataset.action === "defer-agent-plan") toast("计划已保留，可稍后从这里继续执行");
+    else if (actionButton?.dataset.action === "toggle-agent-archive-view") { state.showArchivedAgentSessions = !state.showArchivedAgentSessions; renderMasterAgent(); }
+    else if (actionButton?.dataset.action === "crew-preflight") await runCrewPreflight();
+    else if (event.target.closest("[data-agent-resume-task]")) await resumeAgentTask(event.target.closest("[data-agent-resume-task]").dataset.agentResumeTask);
+    else if (event.target.closest("[data-agent-cancel-task]")) await cancelAgentTask(event.target.closest("[data-agent-cancel-task]").dataset.agentCancelTask);
     else if (actionButton?.dataset.action === "edit-project") openProjectDialog(state.project);
     else if (actionButton?.dataset.action === "toggle-asset-selection") {
       state.assetSelectionMode = !state.assetSelectionMode;
@@ -630,7 +1020,40 @@ document.addEventListener("click", async event => {
       const frame = (prompt?.prompt_metadata?.frames || []).find(item => item.index === Number(copyFrameButton.dataset.frameIndex));
       if (frame) { await navigator.clipboard.writeText(frame.description); toast(`第 ${frame.index} 帧描述已复制`); }
     }
+    else if (copyDirectorOverheadButton) {
+      const prompt = (state.prompts.get(copyDirectorOverheadButton.dataset.copyDirectorOverhead) || [])[0];
+      const directorOverhead = prompt?.prompt_metadata?.director_overhead;
+      if (directorOverhead?.positive_prompt) {
+        await navigator.clipboard.writeText(directorOverhead.positive_prompt);
+        toast("导演俯视参考图提示词已复制");
+      }
+    }
   } catch (error) { loading(false); toast(error.message, "error"); }
+});
+
+document.addEventListener("submit", async event => {
+  if (event.target.id !== "master-agent-form") return;
+  event.preventDefault();
+  const input = $("#master-agent-input");
+  const content = input.value.trim();
+  if (!content || !state.agentSession) return;
+  input.disabled = true;
+  try {
+    await sendAgentMessage(content);
+    input.value = "";
+  } catch (error) { toast(error.message, "error"); }
+  finally { input.disabled = false; }
+});
+
+document.addEventListener("change", async event => {
+  if (event.target.id !== "master-agent-file") return;
+  const file = event.target.files?.[0];
+  if (!file) return;
+  if (!/\.(txt|md)$/i.test(file.name) || file.size > 5 * 1024 * 1024) {
+    toast("请选择不超过 5MB 的 .txt 或 .md 文件", "error"); return;
+  }
+  $("#master-agent-input").value = await file.text();
+  toast(`已读取 ${file.name}，发送前可以继续编辑`);
 });
 
 $("#asset-image-generate-form").addEventListener("submit", async event => {

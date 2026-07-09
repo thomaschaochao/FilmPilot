@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_timeout_seconds: float = 120.0
     deepseek_max_tokens: int = Field(default=32768, ge=1024, le=384000)
+    deepseek_thinking_enabled: bool = True
+    deepseek_reasoning_effort: str = "high"
     validation_rules_version: str = "2026-07-p0"
     storyboard_reference_coverage_threshold: float = 0.8
     storyboard_reference_match_threshold: float = 0.7
@@ -33,6 +35,21 @@ class Settings(BaseSettings):
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     seedream_model: str = "doubao-seedream-5-0-260128"
     image_timeout_seconds: float = 300.0
+    embedding_enabled: bool = True
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_device: str = "auto"
+    embedding_max_length: int = Field(default=2048, ge=256, le=8192)
+    embedding_cpu_batch_size: int = Field(default=4, ge=1, le=128)
+    embedding_gpu_batch_size: int = Field(default=16, ge=1, le=256)
+    embedding_model_path: Path = Path("storage/models/bge-m3")
+    qdrant_path: Path = Path("storage/vector/qdrant")
+    vector_collection: str = "filmagent_knowledge_v1"
+    ark_search_model: str = ""
+    web_timeout_seconds: float = Field(default=30.0, ge=1, le=180)
+    web_max_bytes: int = Field(default=2_000_000, ge=10_000, le=10_000_000)
+    master_agent_ai_enabled: bool = True
+    agent_framework: str = "crewai"
+    crewai_enabled: bool = True
 
     @staticmethod
     def _secret_value(secret: SecretStr | None) -> str | None:

@@ -9,9 +9,11 @@ def test_frontend_entrypoint(client):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert "FilmPilot" in response.text
-    assert "/static/app.js?v=20260703-6" in response.text
-    assert "/static/styles.css?v=20260703-3" in response.text
+    assert "/static/app.js?v=20260709-deepseek-research-1" in response.text
+    assert "/static/styles.css?v=20260709-deepseek-research-1" in response.text
     assert "data-close-dialog" in response.text
+    assert "data-action=\"open-master-agent\"" in response.text
+    assert "总控智能体对话" in response.text
 
     static_response = client.get("/static/styles.css")
     assert static_response.status_code == 200
@@ -30,6 +32,8 @@ def test_frontend_entrypoint(client):
     assert "data-prompt-default-mode" in app_response.text
     assert "data-shot-prompt-mode" in app_response.text
     assert "data-copy-frame" in app_response.text
+    assert "data-copy-director-overhead" in app_response.text
+    assert "director_overhead" in app_response.text
     assert "openChat" in app_response.text
     assert "data-chat-apply" in app_response.text
     assert "chatTargetButton ? null" in app_response.text
@@ -42,6 +46,8 @@ def test_frontend_entrypoint(client):
     assert "运行监控与 Agent 评估" in app_response.text
     assert "agent-run-dialog" in response.text
     assert "openAgentRunDetail" in app_response.text
+    assert 'data-action="crew-preflight"' in app_response.text
+    assert "runCrewPreflight" in app_response.text
 
 
 def test_project_and_script_workflow(client):
@@ -475,7 +481,12 @@ def test_delete_shot_reorders_remaining_shots(client, monkeypatch):
     )
     prompt_response = client.post(f"/api/v1/shots/{scenes[0]['shots'][0]['id']}/prompts/generate")
     assert prompt_response.status_code == 200
-    assert prompt_response.json()["prompt_metadata"]["mode"] == "initial_frame"
+    prompt_metadata = prompt_response.json()["prompt_metadata"]
+    assert prompt_metadata["mode"] == "initial_frame"
+    assert prompt_metadata["strategy"]["recommended_mode"] in {"initial_frame", "storyboard"}
+    assert "keep_spatial_boundaries_respected" in prompt_metadata["strategy"][
+        "continuity_constraints"
+    ]
 
     frames = [
         StoryboardFrameDraft(
@@ -547,6 +558,7 @@ def test_delete_shot_reorders_remaining_shots(client, monkeypatch):
     assert automatic_metadata["frame_count"] == 9
     assert automatic_metadata["frame_count_source"] == "duration_auto"
     assert automatic_metadata["shot_duration_seconds"] == 7.5
+    assert automatic_metadata["strategy"]["recommended_frame_count"] == 9
 
     delete_response = client.delete(f"/api/v1/shots/{scenes[0]['shots'][0]['id']}")
     assert delete_response.status_code == 204
@@ -566,6 +578,65 @@ def test_delete_shot_reorders_remaining_shots(client, monkeypatch):
     restore = client.post(f"/api/v1/storyboard-snapshots/{snapshots[-1]['id']}/restore")
     assert restore.status_code == 200
     assert len(restore.json()[0]["shots"]) == 4
+
+
+def test_complex_shot_prompt_metadata_includes_director_overhead(client, monkeypatch):
+    from app.schemas import PromptDraft, SceneDraft, ShotDraft, StoryboardDraft
+
+    project = client.post(
+        "/api/v1/projects",
+        json={"name": "Blocking Test", "visual_style": "realistic"},
+    ).json()
+    script = client.post(
+        f"/api/v1/projects/{project['id']}/scripts",
+        json={"title": "Gate", "content": "A group crosses the airport gate."},
+    ).json()
+    client.post(f"/api/v1/scripts/{script['id']}/approve")
+    storyboard = StoryboardDraft(
+        scenes=[
+            SceneDraft(
+                sequence=1,
+                heading="Airport gate",
+                shots=[
+                    ShotDraft(
+                        sequence=1,
+                        script_reference="A group crosses the airport gate.",
+                        subject="group of passengers and Pilot",
+                        action=(
+                            "the group moves from the gate through the corridor "
+                            "as Pilot crosses behind them"
+                        ),
+                        environment="airport gate to corridor",
+                        shot_size="wide",
+                        camera_angle="high angle",
+                        camera_motion="tracking pan",
+                        duration_seconds=5.5,
+                    )
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr("app.main.generate_storyboard", lambda *args: storyboard)
+    scenes = client.post(f"/api/v1/scripts/{script['id']}/shots/generate").json()
+    monkeypatch.setattr(
+        "app.main.generate_prompt",
+        lambda *args, **kwargs: PromptDraft(
+            positive_prompt="complex blocking storyboard prompt",
+            subject_position="group at the gate",
+            action_constraints="only specified crossing action",
+            spatial_constraints="inside airport gate and corridor",
+            camera_strategy="wide tracking view",
+        ),
+    )
+
+    response = client.post(f"/api/v1/shots/{scenes[0]['shots'][0]['id']}/prompts/generate")
+
+    assert response.status_code == 200
+    metadata = response.json()["prompt_metadata"]
+    assert metadata["strategy"]["needs_director_overhead"] is True
+    assert metadata["director_overhead"]["type"] == "director_overhead_reference"
+    assert "top-down floor plan" in metadata["director_overhead"]["positive_prompt"]
+    assert "movement arrows" in metadata["director_overhead"]["positive_prompt"]
 
 
 def test_storyboard_business_errors_are_repaired_and_measured(client, monkeypatch):

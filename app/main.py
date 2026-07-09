@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import time
@@ -5,19 +6,23 @@ import unicodedata
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+import httpx
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, inspect, select, text
+from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from app.config import get_settings
 from app.database import Base, engine, get_db
 from app.models import (
+    AgentMessage,
     AgentRun,
+    AgentSession,
+    AgentSessionStatus,
     Asset,
     AssetImage,
     ChangeProposal,
@@ -26,18 +31,31 @@ from app.models import (
     ChatScope,
     ChatThread,
     ChatThreadStatus,
+    CreativeMemory,
+    EmbeddingJob,
     Project,
     ProjectStatus,
     PromptVersion,
     ProposalStatus,
+    ResearchSource,
     Scene,
+    ScriptChunk,
+    ScriptDocument,
+    ScriptSummary,
     ScriptVersion,
     Shot,
     StoryboardSnapshot,
+    WorkflowPlan,
+    WorkflowTask,
+    WorkflowTaskStatus,
 )
 from app.schemas import (
+    AgentMessageCreate,
     AgentMetricsRead,
+    AgentResearchRequest,
     AgentRunDetailRead,
+    AgentSessionCreate,
+    AgentSessionRead,
     AssetCreate,
     AssetImageGenerateRequest,
     AssetImageRead,
@@ -48,22 +66,40 @@ from app.schemas import (
     ChatThreadCreate,
     ChatThreadDetail,
     ChatThreadRead,
+    CrewRuntimePreflightRead,
+    CrewStatusRead,
     ImageProviderRead,
+    PageFetchRequest,
     ProjectCreate,
     ProjectRead,
     ProjectUpdate,
     PromptGenerateRequest,
     PromptRead,
     ProposalOperation,
+    ResearchAdoptRequest,
+    ResearchSourceRead,
+    RetrievalHit,
+    RetrievalQuery,
+    RetrievalRebuildRead,
+    RetrievalRebuildRequest,
+    RetrievalSelfTestRead,
+    RetrievalStatusRead,
     SceneRead,
     ScriptCreate,
     ScriptGenerateRequest,
+    ScriptIndexRead,
     ScriptRead,
     ShotRead,
     ShotUpdate,
     StoryboardDraft,
     StoryboardSnapshotRead,
+    WebSearchRequest,
+    WorkflowPlanCreate,
+    WorkflowPlanRead,
+    WorkflowTaskCheckpointRead,
+    WorkflowTaskRead,
 )
+from app.services.agent_retrieval import get_retrieval_status_snapshot, retrieve_context
 from app.services.chat import (
     ChatValidationError,
     generate_chat_draft,
@@ -71,8 +107,26 @@ from app.services.chat import (
     validate_operation_scope,
     validate_shot_merge_operations,
 )
+from app.services.checkpoint import (
+    build_checkpoint,
+    mark_completed,
+    mark_failed,
+    mark_running,
+    write_checkpoint,
+)
+from app.services.crew import crew_status
+from app.services.crew_runner import CrewStageTool, run_stage_tools
+from app.services.crew_runtime import crew_runtime_preflight
+from app.services.crew_tool_executor import CrewToolExecutionError, execute_crewai_tool
 from app.services.deepseek import DeepSeekClient, DeepSeekError
 from app.services.image_generation import ImageGenerationError, generate_image
+from app.services.orchestrator import continue_conversation, create_plan, index_script
+from app.services.prompt_strategy import (
+    build_director_overhead_prompt,
+    classify_shot_prompt_strategy,
+)
+from app.services.rag import LocalRAG
+from app.services.web_tools import WebToolError, fetch_page, search_web
 from app.services.workflow import (
     extract_assets,
     generate_asset_prompt,
@@ -101,6 +155,12 @@ async def lifespan(_: FastAPI):
             connection.execute(
                 text("ALTER TABLE shots ADD COLUMN duration_seconds FLOAT NOT NULL DEFAULT 4.0")
             )
+    agent_session_columns = {
+        column["name"] for column in inspect(engine).get_columns("agent_sessions")
+    }
+    if "archived_at" not in agent_session_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE agent_sessions ADD COLUMN archived_at DATETIME"))
     agent_run_columns = {column["name"] for column in inspect(engine).get_columns("agent_runs")}
     agent_run_migrations = {
         "error_type": "VARCHAR(64)",
@@ -189,6 +249,13 @@ def require_proposal(db: Session, proposal_id: str) -> ChangeProposal:
     if proposal is None:
         raise HTTPException(status_code=404, detail="Change proposal not found")
     return proposal
+
+
+def require_research_source(db: Session, source_id: str) -> ResearchSource:
+    source = db.get(ResearchSource, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Research source not found")
+    return source
 
 
 def _record_agent_run(
@@ -470,6 +537,33 @@ def update_project(project_id: str, payload: ProjectUpdate, db: DbSession) -> Pr
     db.commit()
     db.refresh(project)
     return project
+
+
+@app.delete(f"{API}/projects/{{project_id}}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(project_id: str, db: DbSession) -> Response:
+    project = require_project(db, project_id)
+    if LocalRAG().status()["qdrant_local"]:
+        try:
+            LocalRAG().delete_project_vectors(project.id)
+        except Exception:
+            pass
+    document_ids = list(
+        db.scalars(select(ScriptDocument.id).where(ScriptDocument.project_id == project.id)).all()
+    )
+    if document_ids:
+        db.execute(delete(EmbeddingJob).where(EmbeddingJob.document_id.in_(document_ids)))
+        db.execute(delete(ScriptSummary).where(ScriptSummary.document_id.in_(document_ids)))
+        db.execute(delete(ScriptChunk).where(ScriptChunk.document_id.in_(document_ids)))
+        db.execute(delete(ScriptDocument).where(ScriptDocument.id.in_(document_ids)))
+    db.query(AgentSession).filter(AgentSession.project_id == project.id).update(
+        {AgentSession.project_id: None}
+    )
+    db.query(CreativeMemory).filter(CreativeMemory.project_id == project.id).update(
+        {CreativeMemory.project_id: None}
+    )
+    db.delete(project)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _next_script_version(db: Session, project_id: str) -> int:
@@ -1135,6 +1229,8 @@ def create_prompt(
     shot = require_shot(db, shot_id)
     project = shot.scene.project
     request = payload or PromptGenerateRequest()
+    prompt_strategy = classify_shot_prompt_strategy(shot)
+    director_overhead = build_director_overhead_prompt(shot, prompt_strategy)
     resolved_frame_count = (
         request.frame_count
         if request.frame_count is not None
@@ -1188,6 +1284,13 @@ def create_prompt(
                 {4: "2x2", 6: "2x3", 9: "3x3"}[resolved_frame_count]
                 if request.mode == "storyboard"
                 else None
+            ),
+            "strategy": prompt_strategy.model_dump(),
+            "director_overhead": director_overhead,
+            "mode_source": (
+                "user_selected"
+                if request.mode != prompt_strategy.recommended_mode
+                else "agent_recommended"
             ),
             "frames": [frame.model_dump() for frame in draft.frames],
         },
@@ -1782,3 +1885,917 @@ def revert_chat_proposal(proposal_id: str, db: DbSession) -> ChangeProposal:
         raise HTTPException(status_code=409, detail=f"Cannot safely revert: {exc}") from exc
     db.refresh(proposal)
     return proposal
+
+
+def _require_agent_session(db: Session, session_id: str) -> AgentSession:
+    session = db.scalar(
+        select(AgentSession)
+        .where(AgentSession.id == session_id)
+        .options(
+            selectinload(AgentSession.messages),
+            selectinload(AgentSession.memories),
+            selectinload(AgentSession.plans).selectinload(WorkflowPlan.tasks),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Agent session not found")
+    return session
+
+
+def _require_workflow_plan(db: Session, plan_id: str) -> WorkflowPlan:
+    plan = db.scalar(
+        select(WorkflowPlan)
+        .where(WorkflowPlan.id == plan_id)
+        .options(selectinload(WorkflowPlan.tasks), selectinload(WorkflowPlan.session))
+    )
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Workflow plan not found")
+    return plan
+
+
+def _require_workflow_task(db: Session, task_id: str) -> WorkflowTask:
+    task = db.get(WorkflowTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Workflow task not found")
+    return task
+
+
+def _agent_stage_option(label: str, plan_id: str, stage: str, description: str) -> dict:
+    return {
+        "label": label,
+        "action": "approve_stage",
+        "plan_id": plan_id,
+        "stage": stage,
+        "description": description,
+    }
+
+
+def _agent_defer_option() -> dict:
+    return {
+        "label": "稍后执行",
+        "action": "defer_plan",
+        "description": "保留当前进度，之后可回到这个对话继续执行。",
+    }
+
+
+def _append_agent_assistant_message(
+    db: Session,
+    session: AgentSession,
+    content: str,
+    *,
+    option_mode: str,
+    reply_options: list[dict] | None = None,
+    extra_metadata: dict | None = None,
+) -> None:
+    metadata = {
+        "option_mode": option_mode,
+        "reply_options": reply_options or [],
+        **(extra_metadata or {}),
+    }
+    db.add(
+        AgentMessage(
+            session_id=session.id,
+            role=ChatMessageRole.assistant,
+            content=content,
+            metadata_json=metadata,
+        )
+    )
+
+
+def _append_project_created_message(db: Session, plan: WorkflowPlan, project: Project) -> None:
+    _append_agent_assistant_message(
+        db,
+        plan.session,
+        (
+            f"项目《{project.name}》和第一版剧本已创建。"
+            "接下来可以执行资产提取与资产提示词生成，我会从剧本里整理人物、场景和道具。"
+        ),
+        option_mode="stage_approval",
+        reply_options=[
+            _agent_stage_option(
+                "执行资产提取与提示词",
+                plan.id,
+                "assets",
+                "提取人物、场景和道具，并为每个资产生成提示词。",
+            ),
+            _agent_defer_option(),
+        ],
+        extra_metadata={"plan_id": plan.id, "stage": "assets"},
+    )
+
+
+def _append_stage_completed_message(db: Session, plan: WorkflowPlan, task: WorkflowTask) -> None:
+    result = task.result_data or {}
+    if task.stage == "assets":
+        asset_count = result.get("asset_count", 0)
+        content = (
+            f"资产提取与资产提示词已完成，共整理出 {asset_count} 个资产。"
+            "你可以点击页面顶部工作流里的“资产管理”查看、编辑、上传参考图或生成图片。"
+            "要继续拆分分镜吗？"
+        )
+        options = [
+            _agent_stage_option(
+                "继续拆分分镜",
+                plan.id,
+                "shots",
+                "根据当前剧本生成场景与镜头列表。",
+            ),
+            _agent_defer_option(),
+        ]
+        next_stage = "shots"
+    elif task.stage == "shots":
+        scene_count = result.get("scene_count", 0)
+        content = (
+            f"分镜拆分已完成，共生成 {scene_count} 个场景。"
+            "你可以点击顶部“分镜设计”查看并调整镜头。"
+            "要继续生成镜头首帧/故事板提示词吗？"
+        )
+        options = [
+            _agent_stage_option(
+                "生成镜头提示词",
+                plan.id,
+                "prompts",
+                "按每个镜头动作复杂度自动选择首帧或故事板提示词。",
+            ),
+            _agent_defer_option(),
+        ]
+        next_stage = "prompts"
+    elif task.stage == "prompts":
+        prompt_count = result.get("prompt_count", 0)
+        content = (
+            f"镜头提示词已生成，共 {prompt_count} 条。"
+            "你可以点击顶部“镜头提示词”查看、复制和重新生成。"
+            "如果需要，下一步可以再规划图片生成批次。"
+        )
+        options = [
+            _agent_stage_option(
+                "提议图片生成批次",
+                plan.id,
+                "images",
+                "先给出可执行的资产图或镜头图生成批次建议。",
+            ),
+            _agent_defer_option(),
+        ]
+        next_stage = "images"
+    elif task.stage == "images":
+        content = "图片生成批次建议已准备好。本阶段到这里结束，你可以继续在各工作流页面检查结果。"
+        options = []
+        next_stage = "completed"
+    else:
+        return
+    _append_agent_assistant_message(
+        db,
+        plan.session,
+        content,
+        option_mode="stage_approval" if options else "stage_completed",
+        reply_options=options,
+        extra_metadata={"plan_id": plan.id, "stage": next_stage},
+    )
+
+
+@app.post(
+    f"{API}/agent/sessions",
+    response_model=AgentSessionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_agent_session(payload: AgentSessionCreate, db: DbSession) -> AgentSession:
+    session = AgentSession(
+        title=payload.title,
+        original_input=payload.initial_input,
+    )
+    db.add(session)
+    db.commit()
+    if payload.initial_input.strip():
+        continue_conversation(db, session, payload.initial_input.strip(), {})
+    return _require_agent_session(db, session.id)
+
+
+@app.get(f"{API}/agent/sessions", response_model=list[AgentSessionRead])
+def list_agent_sessions(
+    db: DbSession,
+    archived: bool = Query(False),
+    include_archived: bool = Query(False),
+) -> list[AgentSession]:
+    statement = select(AgentSession.id)
+    if not include_archived:
+        statement = statement.where(
+            AgentSession.archived_at.is_not(None)
+            if archived
+            else AgentSession.archived_at.is_(None)
+        )
+    ids = list(db.scalars(statement.order_by(AgentSession.updated_at.desc()).limit(30)).all())
+    return [_require_agent_session(db, session_id) for session_id in ids]
+
+
+@app.get(f"{API}/agent/crew/status", response_model=CrewStatusRead)
+def get_agent_crew_status() -> dict:
+    return crew_status()
+
+
+@app.post(f"{API}/agent/crew/preflight", response_model=CrewRuntimePreflightRead)
+def preflight_agent_crew_runtime() -> dict:
+    return crew_runtime_preflight()
+
+
+@app.post(f"{API}/agent/crew/tools/{{tool_name}}/execute")
+def execute_agent_crew_tool(tool_name: str, payload: dict[str, Any], db: DbSession) -> dict:
+    try:
+        result = execute_crewai_tool(tool_name, db=db, **payload)
+    except CrewToolExecutionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"tool": tool_name, "result": result}
+
+
+@app.get(f"{API}/agent/sessions/{{session_id}}", response_model=AgentSessionRead)
+def get_agent_session(session_id: str, db: DbSession) -> AgentSession:
+    return _require_agent_session(db, session_id)
+
+
+@app.post(f"{API}/agent/sessions/{{session_id}}/research", response_model=AgentSessionRead)
+async def research_agent_session(
+    session_id: str, payload: AgentResearchRequest, db: DbSession
+) -> AgentSession:
+    session = _require_agent_session(db, session_id)
+    db.add(
+        AgentMessage(
+            session_id=session.id,
+            role=ChatMessageRole.user,
+            content=f"请联网搜索资料：{payload.query}",
+        )
+    )
+    try:
+        result = await search_web(payload.query)
+    except (WebToolError, RuntimeError) as exc:
+        _append_agent_assistant_message(
+            db,
+            session,
+            f"联网搜索暂时不可用：{exc}",
+            option_mode="research_failed",
+            reply_options=[
+                {
+                    "label": "先不用联网，按剧本继续",
+                    "content": "先不用联网，按当前剧本和已确认设定继续。",
+                    "facts": {},
+                    "description": "跳过外部资料，不影响后续制作流程。",
+                }
+            ],
+        )
+        db.commit()
+        return _require_agent_session(db, session.id)
+
+    persisted_sources = []
+    for source in result.get("sources", []):
+        url = source.get("url")
+        if not url:
+            continue
+        research = ResearchSource(
+            session_id=session.id,
+            query=payload.query,
+            title=source.get("title", url),
+            url=url,
+            summary=result.get("summary", "")[:4000],
+            fetch_method=result.get("provider", "web_search"),
+        )
+        db.add(research)
+        db.flush()
+        persisted_sources.append(
+            {"id": research.id, "title": research.title, "url": research.url}
+        )
+    source_lines = "\n".join(
+        f"- {item['title']}: {item['url']}" for item in persisted_sources[:5]
+    )
+    content = (
+        "联网搜索完成。下面是可用于创作参考的摘要：\n\n"
+        f"{result.get('summary', '').strip() or '搜索未返回可用摘要。'}"
+    )
+    if source_lines:
+        content += f"\n\n来源：\n{source_lines}"
+    _append_agent_assistant_message(
+        db,
+        session,
+        content,
+        option_mode="research_result",
+        reply_options=[
+            {
+                "label": "采用这些资料继续",
+                "content": "采用这些联网资料作为创作参考，继续完善制作计划。",
+                "facts": {},
+                "description": "仅将摘要作为当前对话参考；需要入库时再单独采纳来源。",
+            },
+            {
+                "label": "先不用联网，按剧本继续",
+                "content": "先不用联网，按当前剧本和已确认设定继续。",
+                "facts": {},
+                "description": "不采用这次搜索结果。",
+            },
+        ],
+        extra_metadata={
+            "query": payload.query,
+            "sources": persisted_sources,
+            "provider": result.get("provider"),
+        },
+    )
+    db.commit()
+    return _require_agent_session(db, session.id)
+
+
+@app.post(f"{API}/agent/sessions/{{session_id}}/archive", response_model=AgentSessionRead)
+def archive_agent_session(session_id: str, db: DbSession) -> AgentSession:
+    session = _require_agent_session(db, session_id)
+    session.archived_at = datetime.now(UTC)
+    db.commit()
+    return _require_agent_session(db, session.id)
+
+
+@app.post(f"{API}/agent/sessions/{{session_id}}/unarchive", response_model=AgentSessionRead)
+def unarchive_agent_session(session_id: str, db: DbSession) -> AgentSession:
+    session = _require_agent_session(db, session_id)
+    session.archived_at = None
+    db.commit()
+    return _require_agent_session(db, session.id)
+
+
+@app.delete(f"{API}/agent/sessions/{{session_id}}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_agent_session(session_id: str, db: DbSession) -> Response:
+    session = _require_agent_session(db, session_id)
+    db.delete(session)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(f"{API}/agent/sessions/{{session_id}}/messages", response_model=AgentSessionRead)
+def send_agent_message(
+    session_id: str, payload: AgentMessageCreate, db: DbSession
+) -> AgentSession:
+    session = _require_agent_session(db, session_id)
+    if session.status in {AgentSessionStatus.cancelled, AgentSessionStatus.completed}:
+        raise HTTPException(status_code=409, detail="This agent session is no longer active")
+    continue_conversation(db, session, payload.content, payload.facts)
+    return _require_agent_session(db, session.id)
+
+
+@app.get(
+    f"{API}/agent/sessions/{{session_id}}/memory",
+    response_model=list[dict],
+)
+def list_agent_memory(session_id: str, db: DbSession) -> list[dict]:
+    session = _require_agent_session(db, session_id)
+    return [
+        {
+            "id": item.id,
+            "category": item.category,
+            "key": item.key,
+            "value": item.value,
+            "status": item.status,
+            "source_type": item.source_type,
+        }
+        for item in session.memories
+    ]
+
+
+@app.post(
+    f"{API}/agent/sessions/{{session_id}}/plan",
+    response_model=WorkflowPlanRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_agent_plan(
+    session_id: str, payload: WorkflowPlanCreate, db: DbSession
+) -> WorkflowPlan:
+    session = _require_agent_session(db, session_id)
+    return create_plan(db, session, payload.project_spec, payload.assumptions)
+
+
+@app.post(f"{API}/agent/plans/{{plan_id}}/approve", response_model=AgentSessionRead)
+def approve_agent_plan(
+    plan_id: str, background_tasks: BackgroundTasks, db: DbSession
+) -> AgentSession:
+    plan = _require_workflow_plan(db, plan_id)
+    session = plan.session
+    if plan.missing_information:
+        raise HTTPException(status_code=409, detail="Resolve missing information before approval")
+    if session.project_id:
+        return _require_agent_session(db, session.id)
+    spec = plan.project_spec
+    project = Project(
+        name=spec["name"],
+        description=spec.get("description", ""),
+        visual_style=spec.get("visual_style", "电影感写实"),
+        world_setting=spec.get("world_setting", ""),
+        aspect_ratio=spec.get("aspect_ratio", "16:9"),
+        language=spec.get("language", "zh-CN"),
+        status=ProjectStatus.script_review,
+    )
+    db.add(project)
+    db.flush()
+    script = ScriptVersion(
+        project_id=project.id,
+        version=1,
+        title=spec.get("script_title") or project.name,
+        content=spec.get("script_content") or session.original_input,
+        source_type="user",
+    )
+    db.add(script)
+    session.project_id = project.id
+    session.status = AgentSessionStatus.awaiting_stage_approval
+    session.current_stage = "assets"
+    plan.status = "approved"
+    plan.approved_at = datetime.now(UTC)
+    first_task = next(task for task in plan.tasks if task.stage == "project_script")
+    first_task.status = WorkflowTaskStatus.completed
+    first_task.result_data = {"project_id": project.id, "script_id": script.id}
+    _append_project_created_message(db, plan, project)
+    db.commit()
+    document, embedding_job = index_script(db, script)
+    if not LocalRAG().status()["available"]:
+        embedding_job.status = "keyword_ready"
+        document.status = "ready"
+        _mark_document_current(db, document)
+        db.commit()
+    elif embedding_job.status in {"pending", "failed"}:
+        background_tasks.add_task(_run_embedding_job, embedding_job.id, db.get_bind())
+    return _require_agent_session(db, session.id)
+
+
+@app.post(
+    f"{API}/agent/plans/{{plan_id}}/stages/{{stage_name}}/approve",
+    response_model=WorkflowTaskRead,
+)
+def approve_agent_stage(plan_id: str, stage_name: str, db: DbSession) -> WorkflowTask:
+    plan = _require_workflow_plan(db, plan_id)
+    task = next((item for item in plan.tasks if item.stage == stage_name), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Workflow stage not found")
+    if task.status == WorkflowTaskStatus.completed:
+        return task
+    if not plan.session.project_id:
+        raise HTTPException(status_code=409, detail="Approve the project plan first")
+    project = require_project(db, plan.session.project_id)
+    script = db.scalar(
+        select(ScriptVersion)
+        .where(ScriptVersion.project_id == project.id)
+        .order_by(ScriptVersion.version.desc())
+    )
+    if script is None:
+        raise HTTPException(status_code=409, detail="The project does not have a script")
+    mark_running(
+        task,
+        input_snapshot={
+            "project_id": project.id,
+            "script_id": script.id,
+            "stage": stage_name,
+        },
+    )
+    db.commit()
+    try:
+        if stage_name == "assets":
+            def extract_and_prompt_assets() -> dict:
+                assets = extract_project_assets(project.id, db)
+                for asset in assets:
+                    create_asset_prompt(asset.id, db)
+                return {"asset_count": len(assets)}
+
+            results = run_stage_tools(
+                task,
+                db,
+                [
+                    CrewStageTool("approve_script", lambda: approve_script(script.id, db)),
+                    CrewStageTool("extract_assets", extract_and_prompt_assets),
+                ],
+            )
+            task.result_data = {
+                **(task.result_data or {}),
+                "asset_count": results["extract_assets"]["asset_count"],
+            }
+            next_stage = "shots"
+        elif stage_name == "shots":
+            results = run_stage_tools(
+                task,
+                db,
+                [CrewStageTool("generate_storyboard", lambda: create_shots(script.id, db))],
+            )
+            task.result_data = {
+                **(task.result_data or {}),
+                "scene_count": len(results["generate_storyboard"]),
+            }
+            next_stage = "prompts"
+        elif stage_name == "prompts":
+            def generate_shot_prompts() -> dict:
+                scenes = list_scenes(project.id, db)
+                count = 0
+                mode_counts = {"initial_frame": 0, "storyboard": 0}
+                for scene in scenes:
+                    for shot in scene.shots:
+                        mode = classify_shot_prompt_strategy(shot).recommended_mode
+                        create_prompt(shot.id, db, PromptGenerateRequest(mode=mode))
+                        mode_counts[mode] += 1
+                        count += 1
+                return {
+                    "prompt_count": count,
+                    "mode": "per_shot_strategy",
+                    "mode_counts": mode_counts,
+                }
+
+            results = run_stage_tools(
+                task,
+                db,
+                [CrewStageTool("generate_shot_prompts", generate_shot_prompts)],
+            )
+            task.result_data = {**(task.result_data or {}), **results["generate_shot_prompts"]}
+            next_stage = "images"
+        elif stage_name == "images":
+            suggestion = {"suggestion": "Select key assets before confirming image batches."}
+            run_stage_tools(
+                task,
+                db,
+                [CrewStageTool("get_workflow_status", lambda: suggestion)],
+            )
+            task.result_data = {**(task.result_data or {}), **suggestion}
+            next_stage = "completed"
+        else:
+            raise HTTPException(status_code=409, detail="This stage cannot be executed directly")
+        mark_completed(task, output_snapshot=task.result_data)
+        plan.session.current_stage = next_stage
+        plan.session.status = (
+            AgentSessionStatus.completed
+            if next_stage == "completed"
+            else AgentSessionStatus.awaiting_stage_approval
+        )
+        _append_stage_completed_message(db, plan, task)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        task = db.get(WorkflowTask, task.id)
+        mark_failed(task, exc, last_safe_step="stage_started")
+        db.commit()
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    db.refresh(task)
+    return task
+
+
+@app.get(
+    f"{API}/agent/tasks/{{task_id}}/checkpoint",
+    response_model=WorkflowTaskCheckpointRead,
+)
+def get_agent_task_checkpoint(task_id: str, db: DbSession) -> dict:
+    task = _require_workflow_task(db, task_id)
+    checkpoint = (task.result_data or {}).get("checkpoint")
+    return checkpoint or build_checkpoint(
+        task,
+        status=task.status.value if hasattr(task.status, "value") else str(task.status),
+        last_safe_step="not_started",
+        input_snapshot=task.input_data,
+        output_snapshot=task.result_data,
+    )
+
+
+@app.post(f"{API}/agent/tasks/{{task_id}}/cancel", response_model=WorkflowTaskRead)
+def cancel_agent_task(task_id: str, db: DbSession) -> WorkflowTask:
+    task = _require_workflow_task(db, task_id)
+    if task.status == WorkflowTaskStatus.completed:
+        raise HTTPException(status_code=409, detail="Completed tasks cannot be cancelled")
+    task.status = WorkflowTaskStatus.cancelled
+    task.error_message = "User interrupted the workflow task."
+    write_checkpoint(
+        task,
+        status="failed",
+        last_safe_step="user_interrupted",
+        error={
+            "type": "user_interrupted",
+            "message": "User interrupted the workflow task.",
+            "retryable": False,
+        },
+    )
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post(f"{API}/agent/tasks/{{task_id}}/resume", response_model=WorkflowTaskRead)
+def resume_agent_task(task_id: str, db: DbSession) -> WorkflowTask:
+    task = _require_workflow_task(db, task_id)
+    recovery = (task.result_data or {}).get("recovery", {})
+    if task.status == WorkflowTaskStatus.completed:
+        return task
+    if task.status == WorkflowTaskStatus.cancelled:
+        raise HTTPException(status_code=409, detail="Cancelled tasks cannot be resumed")
+    if recovery and not recovery.get("retryable", True):
+        raise HTTPException(status_code=409, detail="Task is not retryable")
+    task.status = WorkflowTaskStatus.awaiting_approval
+    write_checkpoint(task, status="waiting_user", last_safe_step="resume_requested")
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _run_embedding_job(job_id: str, bind=engine) -> None:
+    worker_session = sessionmaker(bind=bind, autoflush=False, expire_on_commit=False)()
+    try:
+        job = worker_session.get(EmbeddingJob, job_id)
+        if job is None:
+            return
+        document = worker_session.get(ScriptDocument, job.document_id)
+        chunks = list(
+            worker_session.scalars(
+                select(ScriptChunk)
+                .where(ScriptChunk.document_id == document.id)
+                .order_by(ScriptChunk.sequence)
+            ).all()
+        )
+        rag = LocalRAG()
+        rag_status = rag.status()
+        if not rag_status["available"]:
+            job.status = "keyword_ready"
+            document.status = "ready"
+        else:
+            job.status = "embedding"
+            worker_session.commit()
+            rag.index_chunks(
+                [
+                    {
+                        "id": chunk.id,
+                        "content": chunk.content,
+                        "chunk_id": chunk.id,
+                        "project_id": document.project_id,
+                        "script_id": document.script_version_id,
+                        "script_version": document.version,
+                        "content_type": "script_chunk",
+                        "chapter": chunk.chapter,
+                        "scene": chunk.scene,
+                        "characters": chunk.characters,
+                        "locations": chunk.locations,
+                        "content_hash": chunk.content_hash,
+                        "is_current": True,
+                    }
+                    for chunk in chunks
+                ]
+            )
+            job.status = "ready"
+            job.processed_count = len(chunks)
+            document.status = "ready"
+        worker_session.query(ScriptDocument).filter(
+            ScriptDocument.project_id == document.project_id,
+            ScriptDocument.id != document.id,
+        ).update({ScriptDocument.is_current: False})
+        document.is_current = True
+        worker_session.commit()
+    except Exception:
+        worker_session.rollback()
+        job = worker_session.get(EmbeddingJob, job_id)
+        if job:
+            job.status = "failed"
+            job.error_message = "Local embedding or vector indexing failed"
+            worker_session.commit()
+    finally:
+        worker_session.close()
+
+
+def _mark_document_current(db: Session, document: ScriptDocument) -> None:
+    db.query(ScriptDocument).filter(
+        ScriptDocument.project_id == document.project_id,
+        ScriptDocument.id != document.id,
+    ).update({ScriptDocument.is_current: False})
+    document.is_current = True
+
+
+def _script_index_response(db: Session, script_id: str) -> dict:
+    document = db.scalar(
+        select(ScriptDocument).where(ScriptDocument.script_version_id == script_id)
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Script index not found")
+    job = db.scalar(
+        select(EmbeddingJob)
+        .where(EmbeddingJob.document_id == document.id)
+        .order_by(EmbeddingJob.created_at.desc())
+    )
+    count = db.scalar(
+        select(func.count(ScriptChunk.id)).where(ScriptChunk.document_id == document.id)
+    )
+    return {
+        "script_id": script_id,
+        "document_id": document.id,
+        "status": document.status,
+        "is_current": document.is_current,
+        "chunk_count": count or 0,
+        "embedding_status": job.status if job else "not_started",
+        "embedding_model": job.model if job else get_settings().embedding_model,
+    }
+
+
+def _delete_script_index(db: Session, script_id: str, *, delete_vectors: bool = True) -> None:
+    existing = db.scalar(
+        select(ScriptDocument).where(ScriptDocument.script_version_id == script_id)
+    )
+    if existing is None:
+        return
+    if delete_vectors and LocalRAG().status()["qdrant_local"]:
+        try:
+            LocalRAG().delete_script_vectors(script_id)
+        except Exception:
+            pass
+    db.execute(delete(EmbeddingJob).where(EmbeddingJob.document_id == existing.id))
+    db.execute(delete(ScriptSummary).where(ScriptSummary.document_id == existing.id))
+    db.execute(delete(ScriptChunk).where(ScriptChunk.document_id == existing.id))
+    db.delete(existing)
+
+
+@app.post(f"{API}/scripts/{{script_id}}/index", response_model=ScriptIndexRead)
+def create_script_index(
+    script_id: str, background_tasks: BackgroundTasks, db: DbSession
+) -> dict:
+    script = require_script(db, script_id)
+    document, job = index_script(db, script)
+    if not LocalRAG().status()["available"]:
+        job.status = "keyword_ready"
+        document.status = "ready"
+        _mark_document_current(db, document)
+        db.commit()
+    elif job.status in {"pending", "failed"}:
+        background_tasks.add_task(_run_embedding_job, job.id, db.get_bind())
+    return _script_index_response(db, script_id)
+
+
+@app.post(f"{API}/scripts/{{script_id}}/index/rebuild", response_model=ScriptIndexRead)
+def rebuild_script_index(
+    script_id: str, background_tasks: BackgroundTasks, db: DbSession
+) -> dict:
+    script = require_script(db, script_id)
+    _delete_script_index(db, script_id)
+    db.commit()
+    document, job = index_script(db, script)
+    if not LocalRAG().status()["available"]:
+        job.status = "keyword_ready"
+        document.status = "ready"
+        _mark_document_current(db, document)
+        db.commit()
+    else:
+        background_tasks.add_task(_run_embedding_job, job.id, db.get_bind())
+    return _script_index_response(db, script_id)
+
+
+@app.get(f"{API}/scripts/{{script_id}}/index", response_model=ScriptIndexRead)
+def get_script_index(script_id: str, db: DbSession) -> dict:
+    require_script(db, script_id)
+    return _script_index_response(db, script_id)
+
+
+@app.post(f"{API}/agent/retrieval/rebuild", response_model=RetrievalRebuildRead)
+def rebuild_retrieval_index(
+    payload: RetrievalRebuildRequest, background_tasks: BackgroundTasks, db: DbSession
+) -> dict:
+    if payload.project_id:
+        require_project(db, payload.project_id)
+    statement = select(ScriptVersion)
+    if payload.project_id:
+        statement = statement.where(ScriptVersion.project_id == payload.project_id)
+    scripts = list(
+        db.scalars(
+            statement.order_by(ScriptVersion.project_id, ScriptVersion.version)
+        ).all()
+    )
+    rag_status = LocalRAG().status()
+    if rag_status["qdrant_local"]:
+        project_ids = sorted({script.project_id for script in scripts})
+        for project_id in project_ids:
+            try:
+                LocalRAG().delete_project_vectors(project_id)
+            except Exception:
+                pass
+    for script in scripts:
+        _delete_script_index(db, script.id, delete_vectors=False)
+    db.commit()
+
+    rebuilt_count = 0
+    queued_embedding_jobs = 0
+    fallback_count = 0
+    for script in scripts:
+        document, job = index_script(db, script)
+        rebuilt_count += 1
+        if not rag_status["available"]:
+            job.status = "keyword_ready"
+            document.status = "ready"
+            _mark_document_current(db, document)
+            fallback_count += 1
+            db.commit()
+        else:
+            queued_embedding_jobs += 1
+            background_tasks.add_task(_run_embedding_job, job.id, db.get_bind())
+    return {
+        "project_id": payload.project_id,
+        "script_count": len(scripts),
+        "rebuilt_count": rebuilt_count,
+        "queued_embedding_jobs": queued_embedding_jobs,
+        "fallback_count": fallback_count,
+    }
+
+
+@app.get(f"{API}/agent/retrieval/status", response_model=RetrievalStatusRead)
+def get_retrieval_status(db: DbSession) -> dict:
+    settings = get_settings()
+    return {
+        **get_retrieval_status_snapshot(db),
+        "deepseek_thinking_enabled": settings.deepseek_thinking_enabled,
+        "deepseek_reasoning_effort": settings.deepseek_reasoning_effort,
+        "web_search_configured": bool(settings.ark_search_model.strip()),
+    }
+
+
+@app.post(f"{API}/agent/retrieval/self-test", response_model=RetrievalSelfTestRead)
+def run_retrieval_self_test() -> dict:
+    return LocalRAG().self_test()
+
+
+@app.post(f"{API}/agent/retrieve", response_model=list[RetrievalHit])
+def retrieve_agent_context(payload: RetrievalQuery, db: DbSession) -> list[dict]:
+    return retrieve_context(payload, db)
+
+
+@app.post(f"{API}/agent/tools/search")
+async def agent_search_web(payload: WebSearchRequest, db: DbSession) -> dict:
+    if payload.session_id:
+        _require_agent_session(db, payload.session_id)
+    try:
+        result = await search_web(payload.query)
+    except (WebToolError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if payload.session_id:
+        persisted_sources = []
+        for source in result["sources"]:
+            research = ResearchSource(
+                session_id=payload.session_id,
+                query=payload.query,
+                title=source.get("title", source["url"]),
+                url=source["url"],
+                summary=result["summary"][:4000],
+                fetch_method="volcengine",
+            )
+            db.add(research)
+            db.flush()
+            persisted_sources.append(
+                {
+                    "id": research.id,
+                    "title": research.title,
+                    "url": research.url,
+                    "adopted": research.adopted,
+                }
+            )
+        db.commit()
+        result["persisted_sources"] = persisted_sources
+    return result
+
+
+@app.post(
+    f"{API}/agent/research/{{source_id}}/adopt",
+    response_model=ResearchSourceRead,
+)
+def adopt_research_source(
+    source_id: str, payload: ResearchAdoptRequest, db: DbSession
+) -> ResearchSource:
+    source = require_research_source(db, source_id)
+    source.adopted = True
+    source.adoption_reason = payload.adoption_reason.strip()
+    db.commit()
+    db.refresh(source)
+    session = _require_agent_session(db, source.session_id)
+    if source.summary.strip() and LocalRAG().status()["available"]:
+        try:
+            digest = hashlib.sha256(source.summary.encode("utf-8")).hexdigest()
+            LocalRAG().index_chunks(
+                [
+                    {
+                        "id": source.id,
+                        "content": source.summary,
+                        "chunk_id": source.id,
+                        "source_id": source.id,
+                        "session_id": source.session_id,
+                        "project_id": session.project_id,
+                        "script_id": "",
+                        "script_version": 0,
+                        "content_type": "research_source",
+                        "chapter": "research",
+                        "scene": source.title,
+                        "characters": [],
+                        "locations": [],
+                        "memory_status": "researched",
+                        "content_hash": digest,
+                        "is_current": True,
+                    }
+                ]
+            )
+        except Exception:
+            pass
+    return source
+
+
+@app.post(f"{API}/agent/tools/fetch")
+async def agent_fetch_page(payload: PageFetchRequest, db: DbSession) -> dict:
+    if payload.session_id:
+        _require_agent_session(db, payload.session_id)
+    try:
+        result = await fetch_page(payload.url)
+    except (WebToolError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {**result, "content": result["content"][: get_settings().web_max_bytes]}

@@ -1,6 +1,8 @@
 import os
 
 os.environ["FILMAGENT_DATABASE_URL"] = "sqlite:///:memory:"
+os.environ["FILMAGENT_EMBEDDING_ENABLED"] = "false"
+os.environ["FILMAGENT_MASTER_AGENT_AI_ENABLED"] = "false"
 
 import pytest
 from fastapi.testclient import TestClient
